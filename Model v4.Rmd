@@ -1,0 +1,222 @@
+---
+title: "League 2 Model"
+output: html_notebook
+---
+Load necessary libraries and functions
+```{r}
+rm(list=ls())
+
+library(dplyr)
+library(lubridate)
+
+current_league = c("A.F.C. Wimbledon", "Barrow", "Bradford City", "Carlisle United", "Colchester United", "Crawley Town", "Crewe Alexandra", "Doncaster Rovers", "Gillingham", "Grimsby Town", "Harrogate Town A.F.C.", "Hartlepool United", "Leyton Orient", "Mansfield Town", "Newport County", "Northampton Town", "Rochdale", "Salford City", "Stevenage Borough", "Stockport", "Sutton United", "Swindon Town", "Tranmere Rovers", "Walsall")
+```
+
+Load data
+```{r}
+load("england.rda")
+L2 = filter(england, Season == 2016 | Season == 2017 | Season == 2018 | Season == 2019 | Season == 2020 | Season == 2021, division == 4) %>% mutate(home = as.character(home), visitor = as.character(visitor))
+
+current_season = read.csv("League 2 Current Season.csv", stringsAsFactors=T)
+current_season = current_season[-nrow(current_season),]
+
+L2 = rbind(L2, current_season)
+```
+
+```{r}
+# Make a vector of all team names. 
+all_teams <- sort(unique(c(L2$home, L2$visitor)), decreasing = FALSE)
+n_teams <- length(all_teams)
+ 
+# list of parameters with initial values.
+parameter_list <- list(attack = rep(0.2, n_teams),
+                      defense = rep(-0.01, n_teams-1),
+                      home = 0.1,
+                      rho= 0.00)
+ 
+names(parameter_list$attack) <- all_teams
+names(parameter_list$defense) <- all_teams[-1] # the first parameter is computed from the rest.
+```
+
+```{r}
+tau <- Vectorize(function(xx, yy, lambda, mu, rho){
+  if (xx == 0 & yy == 0){return(1 - (lambda*mu*rho))
+  } else if (xx == 0 & yy == 1){return(1 + (lambda*rho))
+  } else if (xx == 1 & yy == 0){return(1 + (mu*rho))
+  } else if (xx == 1 & yy == 1){return(1 - rho)
+  } else {return(1)}
+})
+```
+
+```{r}
+DCweights <- function(dates, xi=0)
+{
+  datediffs <- (as.numeric(as.Date(dates, "%y%y-%m-%d")) - as.numeric(as.Date(Sys.Date()))) * -1
+  #Season Weighting - Change year of time_length date when dataset is updated
+  seasondiffs <- time_length(difftime(as.Date(dates, "%y%y-%m-%d"), "2022-06-30"), "years")
+  seasondiffs <- as.integer(seasondiffs*-1 + 1) 
+  
+  w <- exp(-1*xi*datediffs*seasondiffs)
+  w[datediffs <= 0] <- 0 #Future dates should have zero weights
+  return(w)
+}
+```
+
+```{r}
+dc_negloglik <- function(params, goals_home, goals_visitor,
+                     team_home, team_visitor, param_skeleton){
+   
+  # relist, to make things easier.
+  plist <- relist(params, param_skeleton)
+   
+  # There is a sum-to-zero constraint on defense parameters.
+  # The defense parameter for the first team is computed from the rest.
+  plist$defense <- c(sum(plist$defense), plist$defense)
+  names(plist$defense)[1] <- names(plist$attack[1]) # add name to first element.
+ 
+  # Home team expected goals
+  lambda_home <- exp(plist$attack[team_home] + plist$defense[team_visitor] + plist$home)
+   
+  # Away team expected goals
+  lambda_visitor <- exp(plist$attack[team_visitor] + plist$defense[team_home])
+   
+  # Dixon-Coles adjustment
+  dc_adj <- tau(goals_home, goals_visitor, lambda_home, lambda_visitor, rho = plist$rho)
+   
+  # Trick to avoid warnings.
+  if (any(dc_adj <= 0)){
+    return(Inf)
+  }
+   
+  # The log-likelihood
+  log_lik_home <- dpois(goals_home, lambda = lambda_home, log=TRUE)
+  log_lik_visitor <- dpois(goals_visitor, lambda = lambda_visitor, log=TRUE)
+   
+  log_lik <- sum((log_lik_home + log_lik_visitor + log(dc_adj)))
+   
+  return(log_lik*-1)
+   
+}
+```
+
+```{r}
+dc_negloglikWeighted <- function(params, goals_home, goals_visitor,
+                     team_home, team_visitor, param_skeleton, weights=NULL){
+   # relist, to make things easier.
+  plist <- relist(params, param_skeleton)
+   
+  # There is a sum-to-zero constraint on defense parameters.
+  # The defense parameter for the first team is computed from the rest.
+  plist$defense <- c(sum(plist$defense), plist$defense)
+  names(plist$defense)[1] <- names(plist$attack[1]) # add name to first element.
+ 
+  # Home team expected goals
+  lambda_home <- exp(plist$attack[team_home] + plist$defense[team_visitor] + plist$home)
+   
+  # Away team expected goals
+  lambda_visitor <- exp(plist$attack[team_visitor] + plist$defense[team_home])
+   
+  # Dixon-Coles adjustment
+  dc_adj <- tau(goals_home, goals_visitor, lambda_home, lambda_visitor, rho = plist$rho)
+   
+  # Trick to avoid warnings.
+  if (any(dc_adj <= 0)){
+    return(Inf)
+  }
+   
+  # The log-likelihood
+  log_lik_home <- dpois(goals_home, lambda = lambda_home, log=TRUE)
+  log_lik_visitor <- dpois(goals_visitor, lambda = lambda_visitor, log=TRUE)
+  
+  if (is.null(weights))
+    {
+    log_lik <- sum(log_lik_home + log_lik_visitor + log(dc_adj))
+  } else {
+   log_lik <- sum((log_lik_home + log_lik_visitor + log(dc_adj)) * weights) 
+  }
+   
+  return(log_lik*-1)
+}
+```
+
+
+```{r}
+optim_res <- optim(par = unlist(parameter_list), fn=dc_negloglikWeighted,
+                   goals_home = L2$hgoal,
+                   goals_visitor = L2$vgoal,
+                   weights = DCweights(L2$Date, xi = 0.0018),
+                   team_home = L2$home, team_visitor = L2$visitor,
+                   param_skeleton=parameter_list, method = 'BFGS')
+ 
+# relist, and calculate the remaining parameter. 
+parameter_est <- relist(optim_res$par, parameter_list)
+parameter_est$defense <- c( sum(parameter_est$defense) * -1, parameter_est$defense)
+names(parameter_est$defense)[1] <- names(parameter_est$attack[1])
+```
+
+```{r}
+cutdown <-function(teams, par)
+{
+  indexes <- c()
+  indexes <- append(indexes, match(teams, names(par)))
+  results <- c()
+  
+  for(number in indexes)
+  {
+      results <- append(results, par[number])
+  }
+  
+  return(results)
+  
+}
+```
+
+```{r}
+parameter_est$attack <- cutdown(current_league, parameter_est$attack)
+parameter_est$defense <- cutdown(current_league, parameter_est$defense)
+```
+
+Phase 2: Make a prediction
+```{r}
+lambda <- exp(as.numeric(parameter_est['home']) + as.numeric(parameter_est$attack['Newport County']) + as.numeric(parameter_est$defense['Newport County']))
+
+mu <- exp(as.numeric(parameter_est$attack['A.F.C. Wimbledon']) + as.numeric(parameter_est$defense['A.F.C. Wimbledon']))
+```
+
+Model assumes dependencies in number of goals. Cannot fit to a poisson distribution to determine probabilities of goals scored yet. Also need to incorporate Tau scenarios
+
+Will create a matrix for each poisson distribution 
+```{r}
+maxgoal <- 6 # will be useful later
+probability_matrix <- dpois(0:maxgoal, lambda) %*% t(dpois(0:maxgoal, mu))
+
+#Home is vertical axis, away is horiz axis
+
+scaling_matrix <- matrix(tau(c(0,1,0,1), c(0,0,1,1), lambda, mu, as.numeric(parameter_est['rho'])), nrow=2)
+probability_matrix[1:2, 1:2] <- probability_matrix[1:2, 1:2] * scaling_matrix
+
+HomeWinProbability <- sum(probability_matrix[lower.tri(probability_matrix)])
+DrawProbability <- sum(diag(probability_matrix))
+AwayWinProbability <- sum(probability_matrix[upper.tri(probability_matrix)])
+```
+
+```{r}
+awayG <- numeric(maxgoal)
+ for (gg in 2:maxgoal){
+   awayG[gg-1] <- sum(diag(probability_matrix[,gg:(maxgoal+1)]))
+ }
+awayG[maxgoal] <- probability_matrix[1,(maxgoal+1)]
+ 
+homeG <- numeric(maxgoal)
+  for (gg in 2:maxgoal){
+    homeG[gg-1] <- sum(diag(probability_matrix[gg:(maxgoal+1),]))
+  }
+homeG[maxgoal] <- probability_matrix[(maxgoal+1),1]
+ 
+goaldiffs <- c(rev(awayG), sum(diag(probability_matrix)), homeG)
+names(goaldiffs) <- -maxgoal:maxgoal
+```
+
+```{r}
+plot(-maxgoal:maxgoal, goaldiffs, type='b', main="Goal difference, Newport vs. AFC Wimbledon", ylab="Probability", xlab="Goal difference")
+```
